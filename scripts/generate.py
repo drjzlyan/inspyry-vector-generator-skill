@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """Generate a flat-color vector SVG from a text prompt via the Inspyry API.
 
-A single-file, dependency-free client for the Inspyry public API. It drives the
-asynchronous create -> poll -> save flow, retries transient failures with
-exponential backoff, and exits with meaningful status codes.
+A single-file, dependency-free client for the Inspyry public API. One request
+returns the finished SVG (``POST /v1/vectors``); the client saves it, retries
+transient failures with exponential backoff, and exits with meaningful status
+codes.
 
 Examples
 --------
-    export INSPYRY_API_TOKEN=insp_xxx
-    python3 generate.py "a minimalist flat-design fox icon, 3 solid colors" fox.svg
-    python3 generate.py --credits            # just print the remaining balance
-    python3 generate.py "bold lightning bolt icon" -o out/bolt.svg --json
+    export INSPYRY_API_KEY=ik_xxx
+    python3 generate.py "a sitting fox" fox.svg --style flat-sticker --colours 4
+    python3 generate.py "a laser-cut mushroom" -o m.svg --style stencil --colours 1
+    python3 generate.py --balance            # just print credits / free uses left
+    python3 generate.py "bold lightning bolt" -o out/bolt.svg --json
 
 Exit codes
 ----------
     0  success
     2  usage error (bad arguments / prompt too short)
-    3  authentication error (missing or invalid token, HTTP 401)
+    3  authentication error (missing or invalid API key, HTTP 401)
     4  insufficient credits (HTTP 402)
-    5  generation failed (engine returned status=failed)
+    5  generation failed (422 quality_failed / blocked_prompt, 502 generation_failed)
     6  timed out waiting for the generation
     7  network error reaching the API
     1  any other error
@@ -32,16 +34,41 @@ import argparse
 import json
 import os
 import random
+import re
+import socket
 import sys
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
-DEFAULT_BASE_URL = "https://inspyry.com/api"
-USER_AGENT = "inspyry-vector-generator/1.0 (+https://inspyry.com)"
-MIN_PROMPT_LEN = 5
+DEFAULT_BASE_URL = "https://inspyry.com"
+USER_AGENT = "inspyry-vector-generator/2.0 (+https://inspyry.com)"
+MAX_PROMPT_LEN = 400
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+# 429 with these codes means the allowance is spent for now; retrying is futile.
+NO_RETRY_CODES = {"quota_exceeded", "attempt_limit"}
+
+# Enumerated controls, mirrored from https://inspyry.com/openapi.json.
+STYLES = [
+    "flat-sticker", "stencil", "line-art", "graffiti", "tattoo", "comic", "manga",
+    "cartoon", "esports-mascot", "retro", "art-deco", "art-nouveau", "vaporwave",
+    "cyberpunk", "woodcut", "engraving", "stained-glass", "papercut", "halftone",
+    "doodle", "ukiyoe", "folk-art", "tribal", "celtic", "filigree", "pixel",
+    "low-poly", "isometric", "minimal-icon", "monoline", "geometric", "kawaii",
+    "nautical", "western", "tiki",
+]
+SHAPES = ["free", "circle", "rounded-square", "shield", "die-cut", "wreath",
+          "hexagon", "cameo", "banner", "speech-bubble", "mandala"]
+COMPOSITIONS = ["single", "set", "pattern", "border"]
+LINE_WEIGHTS = ["thin", "medium", "bold"]
+SHADINGS = ["flat", "cel", "hatch", "halftone"]
+VIEWS = ["front", "side", "three-quarter"]
+MOODS = ["playful", "serious", "elegant", "aggressive"]
+DETAILS = ["low", "medium", "high"]
+PALETTES = ["pastel", "neon", "earthy", "duotone", "retro-cmyk", "monochrome",
+            "sunset", "ocean"]
+FLIPS = ["horizontal", "vertical"]
 
 # Exit codes (see module docstring).
 EXIT_OK = 0
@@ -80,27 +107,34 @@ class NetworkError(SkillError):
 
 
 class ApiError(SkillError):
-    """An HTTP-level error from the API. ``code`` is the HTTP status."""
+    """An HTTP-level error from the API. ``code`` is the HTTP status and
+    ``error_code`` the API's machine-readable code (e.g. ``payment_required``)."""
 
-    def __init__(self, code: int, message: str, retry_after: Optional[float] = None):
+    def __init__(self, code: int, message: str, retry_after: Optional[float] = None,
+                 error_code: str = ""):
         super().__init__(message or f"HTTP {code}")
         self.code = code
         self.message = message or f"HTTP {code}"
         self.retry_after = retry_after
+        self.error_code = error_code
 
     @property
     def exit_code(self) -> int:  # type: ignore[override]
+        if self.code in (422, 502):
+            return EXIT_FAILED
         return {401: EXIT_AUTH, 402: EXIT_CREDITS}.get(self.code, EXIT_ERROR)
 
 
 # ─── Client ──────────────────────────────────────────────────────────────────
 
 
-def _extract_error(body: bytes) -> str:
+def _extract_error(body: bytes) -> Tuple[str, str]:
+    """Return ``(message, code)`` from an ``{"error", "code"}`` envelope."""
     try:
-        return str(json.loads(body.decode()).get("error", "")).strip()
+        data = json.loads(body.decode())
+        return str(data.get("error", "")).strip(), str(data.get("code", "")).strip()
     except Exception:
-        return ""
+        return "", ""
 
 
 def _parse_retry_after(value: Optional[str]) -> Optional[float]:
@@ -120,16 +154,12 @@ class InspyryClient:
         token: str,
         base_url: str = DEFAULT_BASE_URL,
         *,
-        poll_interval: float = 2.0,
-        poll_timeout: float = 180.0,
-        http_timeout: float = 60.0,
-        max_retries: int = 4,
+        http_timeout: float = 180.0,
+        max_retries: int = 3,
         log=lambda _msg: None,
     ):
         self.token = token
         self.base_url = base_url.rstrip("/")
-        self.poll_interval = poll_interval
-        self.poll_timeout = poll_timeout
         self.http_timeout = http_timeout
         self.max_retries = max_retries
         self._log = log
@@ -150,11 +180,14 @@ class InspyryClient:
             retry_after = None
             if exc.headers is not None:
                 retry_after = _parse_retry_after(exc.headers.get("Retry-After"))
-            raise ApiError(exc.code, _extract_error(body) or (exc.reason or ""), retry_after)
+            message, err_code = _extract_error(body)
+            raise ApiError(exc.code, message or (exc.reason or ""), retry_after, err_code)
         except urllib.error.URLError as exc:
+            if isinstance(exc.reason, (TimeoutError, socket.timeout)):
+                raise TimeoutExceeded(f"timed out after {self.http_timeout:.0f}s")
             raise NetworkError(f"could not reach {self.base_url}: {exc.reason}")
-        except TimeoutError:
-            raise NetworkError("the request timed out")
+        except (TimeoutError, socket.timeout):
+            raise TimeoutExceeded(f"timed out after {self.http_timeout:.0f}s")
 
     def _backoff(self, attempt: int) -> float:
         # Exponential backoff with full jitter, capped at 30s.
@@ -173,7 +206,8 @@ class InspyryClient:
             try:
                 raw = self._http(req)
             except ApiError as exc:
-                if exc.code in RETRYABLE_STATUS and attempt < self.max_retries:
+                if (exc.code in RETRYABLE_STATUS and exc.error_code not in NO_RETRY_CODES
+                        and attempt < self.max_retries):
                     delay = exc.retry_after if exc.retry_after is not None else self._backoff(attempt)
                     self._log(f"API returned {exc.code}; retrying in {delay:.1f}s "
                               f"(attempt {attempt + 1}/{self.max_retries})")
@@ -182,7 +216,8 @@ class InspyryClient:
                     continue
                 raise
             except NetworkError as exc:
-                if attempt < self.max_retries:
+                # A POST that timed out may still have been charged; never replay it.
+                if method == "GET" and attempt < self.max_retries:
                     delay = self._backoff(attempt)
                     self._log(f"{exc}; retrying in {delay:.1f}s "
                               f"(attempt {attempt + 1}/{self.max_retries})")
@@ -199,37 +234,37 @@ class InspyryClient:
 
     # -- endpoints -----------------------------------------------------------
 
-    def credits(self) -> Dict[str, Any]:
-        return self._send("GET", "/v1/credits")
+    def balance(self) -> Dict[str, Any]:
+        return self._send("GET", "/v1/balance")
 
-    def generate(self, prompt: str) -> Dict[str, Any]:
-        """Create a generation and poll until it succeeds. Returns the job dict."""
-        created = self._send("POST", "/v1/generations", {"prompt": prompt})
-        gen_id = created.get("id")
-        if not gen_id:
-            raise ApiError(0, "the API did not return a generation id")
-        self._log(f"created {gen_id} (status={created.get('status', 'queued')}); polling …")
-
-        deadline = time.monotonic() + self.poll_timeout
-        while time.monotonic() < deadline:
-            job = self._send("GET", f"/v1/generations/{gen_id}")
-            status = job.get("status")
-            if status == "succeeded":
-                svg = job.get("svg") or ""
-                if "<svg" not in svg.lower():
-                    raise GenerationError("the generation succeeded but returned no SVG payload")
-                return job
-            if status == "failed":
-                raise GenerationError(job.get("error") or "the generation failed")
-            self._log(f"  status={status} …")
-            time.sleep(self.poll_interval)
-        raise TimeoutExceeded(
-            f"timed out after {self.poll_timeout:.0f}s waiting for {gen_id}; "
-            "the job may still finish — re-poll or try again"
-        )
+    def generate(self, prompt: str, **controls: Any) -> Dict[str, Any]:
+        """Generate an SVG in a single request. Returns the response dict."""
+        body: Dict[str, Any] = {"prompt": prompt}
+        body.update({k: v for k, v in controls.items() if v is not None})
+        job = self._send("POST", "/v1/vectors", body)
+        if "<svg" not in (job.get("svg") or "").lower():
+            raise GenerationError("the API returned no SVG payload")
+        return job
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
+
+
+def _hex(value: str) -> str:
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        raise argparse.ArgumentTypeError(f"{value!r} is not a #rrggbb colour")
+    return value
+
+
+def _palette(value: str):
+    if value in PALETTES:
+        return value
+    parts = [c.strip() for c in value.split(",") if c.strip()]
+    if parts:
+        return [_hex(c) for c in parts]
+    raise argparse.ArgumentTypeError(
+        f"palette must be one of {', '.join(PALETTES)} or comma-separated #rrggbb colours"
+    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -238,34 +273,79 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Generate a flat-color vector SVG from a text prompt via the Inspyry API.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("prompt", nargs="?", help="the text prompt (>= %d chars)" % MIN_PROMPT_LEN)
+    p.add_argument("prompt", nargs="?", help="what to draw (max %d chars)" % MAX_PROMPT_LEN)
     p.add_argument("output", nargs="?", help="output path (default: output.svg)")
     p.add_argument("-o", "--output", dest="output_flag", metavar="PATH",
                    help="output path (overrides the positional output)")
-    p.add_argument("--token", help="API token (overrides $INSPYRY_API_TOKEN)")
+    p.add_argument("--token", "--key", dest="token",
+                   help="API key (overrides $INSPYRY_API_KEY)")
     p.add_argument("--base-url", default=os.environ.get("INSPYRY_API_BASE", DEFAULT_BASE_URL),
                    help="API base URL (default: %(default)s)")
-    p.add_argument("--credits", action="store_true",
-                   help="print the remaining credit balance and exit (no generation)")
+    p.add_argument("--balance", "--credits", dest="balance", action="store_true",
+                   help="print credits / free uses left and exit (no generation)")
     p.add_argument("--timeout", type=float, default=180.0,
-                   help="seconds to wait for the generation (default: %(default)s)")
-    p.add_argument("--poll-interval", type=float, default=2.0,
-                   help="seconds between status polls (default: %(default)s)")
-    p.add_argument("--max-retries", type=int, default=4,
+                   help="seconds to wait for the API (default: %(default)s)")
+    p.add_argument("--max-retries", type=int, default=3,
                    help="retries for transient errors (default: %(default)s)")
     p.add_argument("--json", action="store_true",
                    help="emit a JSON result object on stdout")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="suppress progress messages on stderr")
+
+    g = p.add_argument_group("generation controls (all optional)")
+    g.add_argument("--style", choices=STYLES, metavar="STYLE",
+                   help="art style, e.g. flat-sticker, stencil, line-art (see SKILL.md)")
+    g.add_argument("--shape", choices=SHAPES)
+    g.add_argument("--composition", choices=COMPOSITIONS)
+    g.add_argument("--line-weight", dest="lineWeight", choices=LINE_WEIGHTS)
+    g.add_argument("--shading", choices=SHADINGS)
+    g.add_argument("--view", choices=VIEWS)
+    g.add_argument("--mood", choices=MOODS)
+    g.add_argument("--avoid", help="things to leave out (max 200 chars)")
+    g.add_argument("--colours", "--colors", dest="colours", type=int, choices=range(1, 17),
+                   metavar="1-16", help="number of colours; 1 makes a single-colour stencil")
+    g.add_argument("--detail", choices=DETAILS)
+    g.add_argument("--palette", type=_palette, metavar="PALETTE",
+                   help="preset (%s) or comma-separated #rrggbb list" % ", ".join(PALETTES))
+    g.add_argument("--background", type=_hex, metavar="#RRGGBB",
+                   help="solid background colour (default: transparent)")
+    g.add_argument("--outline", type=_hex, metavar="#RRGGBB",
+                   help="outline-only artwork in this colour (see --outline-width)")
+    g.add_argument("--outline-width", type=float, default=2.0, metavar="N",
+                   help="outline width used with --outline (default: %(default)s)")
+    g.add_argument("--aspect", type=float, help="width / height of the canvas (0.1-10)")
+    g.add_argument("--margin", type=float, help="padding as a fraction of the canvas (0-0.5)")
+    g.add_argument("--flip", choices=FLIPS)
     return p
 
 
+def _controls(args: argparse.Namespace) -> Dict[str, Any]:
+    c: Dict[str, Any] = {
+        k: getattr(args, k)
+        for k in ("style", "shape", "composition", "lineWeight", "shading", "view",
+                  "mood", "avoid", "colours", "detail", "palette", "aspect", "margin", "flip")
+        if getattr(args, k) is not None
+    }
+    if args.background:
+        c["background"] = {"kind": "solid", "colour": args.background}
+    if args.outline:
+        c["outline"] = {"colour": args.outline, "width": args.outline_width}
+    if "aspect" in c and not 0.1 <= c["aspect"] <= 10:
+        raise UsageError("--aspect must be between 0.1 and 10.")
+    if "margin" in c and not 0 <= c["margin"] <= 0.5:
+        raise UsageError("--margin must be between 0 and 0.5.")
+    if "avoid" in c and len(c["avoid"]) > 200:
+        raise UsageError("--avoid must be at most 200 characters.")
+    return c
+
+
 def _resolve_token(args: argparse.Namespace) -> str:
-    token = (args.token or os.environ.get("INSPYRY_API_TOKEN", "")).strip()
+    token = (args.token or os.environ.get("INSPYRY_API_KEY")
+             or os.environ.get("INSPYRY_API_TOKEN") or "").strip()
     if not token:
         raise SkillError(
-            "No API token. Set $INSPYRY_API_TOKEN or pass --token. "
-            "Create one at inspyry.com → account menu → API access."
+            "No API key. Set $INSPYRY_API_KEY or pass --key. "
+            "Buy credits, then create a key at https://inspyry.com/account."
         )
     return token
 
@@ -288,37 +368,45 @@ def run(argv: Optional[list] = None) -> int:
     client = InspyryClient(
         token,
         base_url=args.base_url,
-        poll_interval=args.poll_interval,
-        poll_timeout=args.timeout,
+        http_timeout=args.timeout,
         max_retries=args.max_retries,
         log=log,
     )
 
-    if args.credits:
-        data = client.credits()
+    if args.balance:
+        data = client.balance()
         if args.json:
             print(json.dumps(data))
         else:
-            print(f"balance: {data.get('balance', '?')} credits")
+            print(f"credits: {data.get('credits', '?')} · "
+                  f"free left today: {data.get('free_left', '?')}/{data.get('free_limit', '?')}")
         return EXIT_OK
 
     prompt = (args.prompt or "").strip()
     if not prompt:
         raise UsageError('A prompt is required. Usage: generate.py "<prompt>" [output.svg]')
-    if len(prompt) < MIN_PROMPT_LEN:
-        raise UsageError(f"Prompt must be at least {MIN_PROMPT_LEN} characters.")
+    if len(prompt) > MAX_PROMPT_LEN:
+        raise UsageError(f"Prompt must be at most {MAX_PROMPT_LEN} characters.")
+    controls = _controls(args)
 
     out_path = args.output_flag or args.output or "output.svg"
-    job = client.generate(prompt)
+    log("generating …")
+    job = client.generate(prompt, **controls)
     saved = _write_svg(job["svg"], out_path)
+    for warning in job.get("warnings") or []:
+        log(f"warning: {warning}")
 
     if args.json:
         print(json.dumps({
             "id": job.get("id"),
-            "status": job.get("status"),
             "path": os.path.abspath(saved),
             "bytes": len(job["svg"].encode("utf-8")),
-            "tags": job.get("tags", []),
+            "svg_url": job.get("svg_url"),
+            "license": job.get("license"),
+            "credits_used": job.get("credits_used"),
+            "credits_left": job.get("credits_left"),
+            "free_left": job.get("free_left"),
+            "warnings": job.get("warnings", []),
         }))
     else:
         print(saved)
@@ -333,10 +421,15 @@ def main() -> None:
         sys.exit(130)
     except ApiError as exc:
         hint = {
-            EXIT_AUTH: " — check your API token (inspyry.com → API access)",
-            EXIT_CREDITS: " — top up at inspyry.com",
-        }.get(exc.exit_code, "")
-        print(f"error: API {exc.code}: {exc.message}{hint}", file=sys.stderr)
+            "invalid_api_key": " — check your API key (https://inspyry.com/account)",
+            "payment_required": " — buy credits at https://inspyry.com/pricing",
+            "quota_exceeded": " — free allowance used up for now; use an API key or retry later",
+            "blocked_prompt": " — the prompt was filtered; rephrase it (not charged)",
+            "quality_failed": " — result failed the quality check; simplify the prompt (not charged)",
+        }.get(exc.error_code, "")
+        print(f"error: API {exc.code}"
+              f"{' ' + exc.error_code if exc.error_code else ''}: {exc.message}{hint}",
+              file=sys.stderr)
         sys.exit(exc.exit_code)
     except SkillError as exc:
         print(f"error: {exc}", file=sys.stderr)

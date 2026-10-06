@@ -1,15 +1,15 @@
 # Inspyry Vector Generator — agent skill
 
 A portable **agent skill** that generates clean, **flat-color vector (SVG)**
-artwork from a text prompt using the [Inspyry](https://inspyry.com) public API.
+artwork from a text prompt using the [Inspyry](https://inspyry.com) [REST API and MCP server](https://inspyry.com/docs).
 Output is editable, scalable SVG — ideal for logos, icons, mascots, badges, and
 wordmarks.
 
 It's designed to plug into **any AI agent or LLM tool-calling setup**, not just
 one vendor. The core is a dependency-free Python CLI
-([`scripts/generate.py`](scripts/generate.py)) that drives the asynchronous
-*create → poll → save* flow, retries transient failures with exponential
-backoff, and exits with meaningful status codes — so any agent that can run a
+([`scripts/generate.py`](scripts/generate.py)) that makes one
+`POST /v1/vectors` request, saves the SVG, retries transient failures with
+exponential backoff, and exits with meaningful status codes — so any agent that can run a
 shell command (or call the underlying [HTTP API](#use-from-any-agent)) can use
 it. [`SKILL.md`](SKILL.md) is the model-readable manifest describing when and how
 to invoke it.
@@ -32,9 +32,16 @@ agent:
   ```bash
   python3 scripts/generate.py "<prompt>" <output>.svg
   ```
-  The `--json` flag returns a structured result (`{id,status,path,bytes,tags}`)
+  The `--json` flag returns a structured result (`{id,path,bytes,svg_url,license,credits_*,free_left,warnings}`)
   for easy parsing, and the [exit codes](#exit-codes) let the agent branch on
   failures (auth, credits, timeout, …) without scraping text.
+- **MCP** — Inspyry hosts an MCP server (`generate_vector`, `get_balance`) at
+  `https://inspyry.com/mcp`; works keyless (free personal-use allowance) or
+  with your key:
+  ```bash
+  claude mcp add --transport http inspyry https://inspyry.com/mcp \
+    --header "Authorization: Bearer ik_your_key"
+  ```
 - **No wrapper at all** — call the [HTTP API directly](#use-from-any-agent);
   the CLI is just a convenience over a handful of REST endpoints.
 
@@ -43,40 +50,37 @@ Whatever the host, behavior, prompting guidance, and the API are identical —
 
 ## Prerequisites
 
-1. **API token** — create one at `inspyry.com → account menu → API access →
-   Request token`. It looks like `insp_…`. Provide it via the
-   `INSPYRY_API_TOKEN` environment variable (or `--token`).
-2. **Credits** — each successful generation costs 1 credit (failed ones are
-   auto-refunded). Check the balance with `--credits`.
+1. **API key** — buy credits, then create a key (`ik_…`) on your
+   [account page](https://inspyry.com/account). Provide it via
+   `INSPYRY_API_KEY` (or `--key`). A key includes the commercial licence.
+   Without a key only the website and MCP server work (small free allowance,
+   personal use only).
+2. **Credits** — check with `--balance`. Failed or filtered generations are
+   never charged.
 
 ## Usage
 
 ```bash
-export INSPYRY_API_TOKEN=insp_xxx
+export INSPYRY_API_KEY=ik_xxx
 
-# generate and save
-python3 scripts/generate.py "a minimalist flat-design fox icon, 3 solid colors" fox.svg
+# generate and save, with controls
+python3 scripts/generate.py "a sitting fox" fox.svg --style flat-sticker --colours 4 --palette earthy
 
-# check remaining credits
-python3 scripts/generate.py --credits
+# single-colour cut file
+python3 scripts/generate.py "a laser-cut mushroom" -o m.svg --style stencil --colours 1
 
-# machine-readable result
-python3 scripts/generate.py "bold lightning bolt icon, flat vector" -o out/bolt.svg --json
+# credits and free uses left
+python3 scripts/generate.py --balance
 ```
 
 ### Options
 
-| Flag | Purpose |
-| --- | --- |
-| `-o, --output PATH` | output path (also accepted as the 2nd positional arg) |
-| `--token TOKEN` | API token (overrides `$INSPYRY_API_TOKEN`) |
-| `--base-url URL` | API base URL (default `https://inspyry.com/api`) |
-| `--credits` | print the credit balance and exit |
-| `--timeout N` | seconds to wait for the generation (default 180) |
-| `--poll-interval N` | seconds between status polls (default 2) |
-| `--max-retries N` | retries for transient errors (default 4) |
-| `--json` | emit a JSON result object on stdout |
-| `-q, --quiet` | suppress progress messages on stderr |
+Run `python3 scripts/generate.py --help` for the full list. Highlights:
+`--style`, `--shape`, `--composition`, `--line-weight`, `--shading`, `--view`,
+`--mood`, `--detail`, `--colours 1-16`, `--palette`, `--background`,
+`--outline`, `--aspect`, `--margin`, `--flip`, `--avoid`, plus `--json`,
+`--key`, `--base-url`, `--timeout`, `--max-retries`, `-q`. Enum values are listed
+in [`SKILL.md`](SKILL.md).
 
 ### Exit codes
 
@@ -84,39 +88,32 @@ python3 scripts/generate.py "bold lightning bolt icon, flat vector" -o out/bolt.
 | --- | --- |
 | 0 | success |
 | 2 | usage error (bad arguments / prompt too short) |
-| 3 | authentication error (missing or invalid token) |
+| 3 | authentication error (missing or invalid key) |
 | 4 | insufficient credits |
-| 5 | generation failed (engine returned `failed`) |
-| 6 | timed out waiting for the generation |
+| 5 | generation failed or filtered (422 / 502) |
+| 6 | request timed out |
 | 7 | network error reaching the API |
 | 1 | any other error |
 
 ## Use from any agent
 
 The CLI is a thin convenience over a small REST API, so an agent can skip it
-entirely and call the endpoints directly. Auth is a bearer token; generation is
-asynchronous (create, then poll until `status` is `succeeded`):
+entirely. Auth is a bearer key; generation is a single synchronous request:
 
 ```bash
-# create
-ID=$(curl -s -X POST "https://inspyry.com/api/v1/generations" \
-  -H "Authorization: Bearer $INSPYRY_API_TOKEN" -H "Content-Type: application/json" \
-  -d '{"prompt":"a bold lightning bolt icon, flat vector"}' | jq -r .id)
-
-# poll until succeeded, then save the SVG
-curl -s "https://inspyry.com/api/v1/generations/$ID" \
-  -H "Authorization: Bearer $INSPYRY_API_TOKEN" | jq -r .svg > out.svg
+curl -s https://inspyry.com/v1/vectors \
+  -H "Authorization: Bearer $INSPYRY_API_KEY" -H "Content-Type: application/json" \
+  -d '{"prompt":"a laser-cut mushroom","style":"stencil","colours":1}' | jq -r .svg > out.svg
 ```
 
-A machine-readable OpenAPI spec is available at `GET
-https://inspyry.com/api/v1/openapi.json`. See [`SKILL.md`](SKILL.md) for the full
-endpoint and error reference.
+The OpenAPI spec is at <https://inspyry.com/openapi.json>; docs at
+<https://inspyry.com/docs>. See [`SKILL.md`](SKILL.md) for controls and errors.
 
 ## Prompting tips
 
 The engine produces **flat-color vector art** — lead with a single, centered
-subject, name exact bold colors, and quote any text verbatim. Omit
-`photorealistic`, `3D`, and `gradient` (they're stripped). See
+subject, use the style/colour/palette controls rather than prose, and quote any
+text verbatim. Omit `photorealistic`, `3D`, and `gradient`. See
 [`SKILL.md`](SKILL.md) for the full prompting guide and API reference.
 
 ## Development
